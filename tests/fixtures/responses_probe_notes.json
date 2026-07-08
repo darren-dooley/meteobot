@@ -1,0 +1,30 @@
+{
+  "history_as_sent_on_second_call": [
+    {
+      "role": "user",
+      "content": "What's the weather in London and Paris right now?"
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_qNxcWhcXv8BexP3pNwT5JVdF",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"London\"}"
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_tLBNdsMwrfPE1wimnY9WpS6g",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Paris\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_qNxcWhcXv8BexP3pNwT5JVdF",
+      "output": "{\"location\": \"London, England, United Kingdom\", \"temperature_c\": 21.8, \"feels_like_c\": 21.2, \"humidity_percent\": 57, \"wind_speed_kmh\": 11.9, \"conditions\": \"overcast\", \"observed_at\": \"2026-07-05T10:15\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_tLBNdsMwrfPE1wimnY9WpS6g",
+      "output": "{\"location\": \"Paris, Ile-de-France, France\", \"temperature_c\": 25.4, \"feels_like_c\": 25.0, \"humidity_percent\": 48, \"wind_speed_kmh\": 8.3, \"conditions\": \"mainly clear\", \"observed_at\": \"2026-07-05T11:15\"}"
+    }
+  ]
+}

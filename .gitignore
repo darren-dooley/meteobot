@@ -1,0 +1,17 @@
+# local env / secrets
+.env
+
+# python
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# claude code local settings
+.claude/settings.json
+
+# private working material, not part of the submission
+artifacts/
+prototype/
+teach/

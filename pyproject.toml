@@ -1,0 +1,39 @@
+[project]
+name = "meteobot"
+version = "0.1.0"
+description = "CLI weather assistant: natural-language questions answered with live Open-Meteo data via an LLM agent."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28",
+    "openai>=1.60",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+meteobot = "meteobot.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.10"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.25",
+]
+
+[tool.pyright]
+# Resolve imports against the uv-managed virtualenv rather than whatever
+# Python is on PATH, so editors/type-checkers see the installed deps (incl.
+# the dev group: pytest, pytest-asyncio). uv creates ./.venv by default.
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "live: opt-in tests against the real Open-Meteo and OpenAI APIs (needs a key; excluded by default)",
+]
+addopts = "-m 'not live'"
