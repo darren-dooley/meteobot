@@ -28,20 +28,40 @@ from meteobot.deps import Deps
 
 logger = logging.getLogger(__name__)
 
-# LangSmith documents its OTel collector as the base `.../otel` URL, which the
-# OTel SDK's env-var path expands to `.../otel/v1/traces`. The exporter's
-# `endpoint=` constructor argument is used verbatim, though, so we append the
-# traces signal path ourselves — configuring the base URL and posting to `/otel`
-# is a 403.
+# LangSmith's OTel collector lives at the API base URL + "/otel", and the OTLP
+# HTTP exporter's `endpoint=` argument is used verbatim (unlike the OTel env-var
+# path, it does not append the signal path), so we build the full traces URL
+# ourselves: `<base>/otel/v1/traces`. Posting to a bare `/otel` is a 403.
+_OTEL_PATH = "/otel"
 _TRACES_SIGNAL_PATH = "/v1/traces"
 
 
 def _traces_endpoint(base: str) -> str:
-    """Resolve the configured base URL to the OTLP traces endpoint."""
-    trimmed = base.rstrip("/")
-    if trimmed.endswith(_TRACES_SIGNAL_PATH):
-        return trimmed
-    return trimmed + _TRACES_SIGNAL_PATH
+    """Resolve the LangSmith API base URL to the OTLP traces endpoint."""
+    url = base.rstrip("/")
+    if not url.endswith(_OTEL_PATH) and not url.endswith(_OTEL_PATH + _TRACES_SIGNAL_PATH):
+        url += _OTEL_PATH
+    if not url.endswith(_TRACES_SIGNAL_PATH):
+        url += _TRACES_SIGNAL_PATH
+    return url
+
+
+def _langsmith_headers(settings: Settings) -> dict[str, str]:
+    """The OTLP request headers that authenticate and route the trace.
+
+    The API key routes to the account; the project names the trace group; a key
+    linked to more than one workspace also needs the workspace id, or the ingest
+    forbids the request (HTTP 403). Secrets live only in these request headers,
+    never in a span attribute — precondition: a key is present.
+    """
+    assert settings.langsmith_api_key is not None
+    headers = {
+        "x-api-key": settings.langsmith_api_key,
+        "Langsmith-Project": settings.langsmith_project,
+    }
+    if settings.langsmith_workspace_id is not None:
+        headers["Langsmith-Workspace-Id"] = settings.langsmith_workspace_id
+    return headers
 
 
 def build_instrumentation(
@@ -67,10 +87,7 @@ def build_instrumentation(
     try:
         exporter = OTLPSpanExporter(
             endpoint=_traces_endpoint(settings.langsmith_endpoint),
-            headers={
-                "x-api-key": settings.langsmith_api_key,
-                "Langsmith-Project": settings.langsmith_project,
-            },
+            headers=_langsmith_headers(settings),
         )
         provider = TracerProvider()
         provider.add_span_processor(BatchSpanProcessor(exporter))

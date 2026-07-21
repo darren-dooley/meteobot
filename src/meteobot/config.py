@@ -30,7 +30,9 @@ DEFAULT_REQUEST_LIMIT = 6
 DEFAULT_TOTAL_TOKENS_LIMIT = 100_000
 DEFAULT_LOG_LEVEL = "WARNING"
 
-DEFAULT_LANGSMITH_ENDPOINT = "https://api.smith.langchain.com/otel"
+# The LangSmith API base URL (LangSmith's own LANGSMITH_ENDPOINT convention).
+# The OTel collector lives at this base + "/otel"; tracing.py derives that.
+DEFAULT_LANGSMITH_ENDPOINT = "https://api.smith.langchain.com"
 DEFAULT_LANGSMITH_PROJECT = "meteobot"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -114,6 +116,9 @@ class Settings:
     langsmith_api_key: str | None
     langsmith_endpoint: str
     langsmith_project: str
+    # Required only when a LangSmith key is linked to more than one workspace,
+    # in which case the OTel ingest forbids the request without it (HTTP 403).
+    langsmith_workspace_id: str | None = None
 
 
 def load_settings() -> Settings:
@@ -147,12 +152,15 @@ def load_settings() -> Settings:
             "METEOBOT_TOTAL_TOKENS_LIMIT", DEFAULT_TOTAL_TOKENS_LIMIT
         ),
         log_level=_log_level("METEOBOT_LOG_LEVEL", DEFAULT_LOG_LEVEL),
-        tracing_enabled=_bool("METEOBOT_TRACING", False),
+        # LangSmith's own env-var conventions, so a standard LangSmith .env works.
+        tracing_enabled=_bool("LANGSMITH_TRACING", False),
         langsmith_api_key=langsmith_api_key,
         langsmith_endpoint=os.environ.get(
-            "LANGSMITH_OTEL_ENDPOINT", DEFAULT_LANGSMITH_ENDPOINT
+            "LANGSMITH_ENDPOINT", DEFAULT_LANGSMITH_ENDPOINT
         ),
         langsmith_project=os.environ.get(
             "LANGSMITH_PROJECT", DEFAULT_LANGSMITH_PROJECT
         ),
+        langsmith_workspace_id=os.environ.get("LANGSMITH_WORKSPACE_ID", "").strip()
+        or None,
     )

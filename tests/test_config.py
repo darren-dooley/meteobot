@@ -26,10 +26,11 @@ MANAGED_VARS = (
     "METEOBOT_REQUEST_LIMIT",
     "METEOBOT_TOTAL_TOKENS_LIMIT",
     "METEOBOT_LOG_LEVEL",
-    "METEOBOT_TRACING",
+    "LANGSMITH_TRACING",
     "LANGSMITH_API_KEY",
-    "LANGSMITH_OTEL_ENDPOINT",
+    "LANGSMITH_ENDPOINT",
     "LANGSMITH_PROJECT",
+    "LANGSMITH_WORKSPACE_ID",
 )
 
 
@@ -62,6 +63,7 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.langsmith_api_key is None
     assert settings.langsmith_endpoint == DEFAULT_LANGSMITH_ENDPOINT
     assert settings.langsmith_project == DEFAULT_LANGSMITH_PROJECT
+    assert settings.langsmith_workspace_id is None
 
 
 def test_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -83,15 +85,17 @@ def test_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_langsmith_and_tracing_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.setenv("METEOBOT_TRACING", "true")
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
     monkeypatch.setenv("LANGSMITH_API_KEY", "ls-secret")
-    monkeypatch.setenv("LANGSMITH_OTEL_ENDPOINT", "https://example.test/otel")
+    monkeypatch.setenv("LANGSMITH_ENDPOINT", "https://example.test")
     monkeypatch.setenv("LANGSMITH_PROJECT", "my-project")
+    monkeypatch.setenv("LANGSMITH_WORKSPACE_ID", "ws-123")
     settings = load_settings()
     assert settings.tracing_enabled is True
     assert settings.langsmith_api_key == "ls-secret"
-    assert settings.langsmith_endpoint == "https://example.test/otel"
+    assert settings.langsmith_endpoint == "https://example.test"
     assert settings.langsmith_project == "my-project"
+    assert settings.langsmith_workspace_id == "ws-123"
 
 
 @pytest.mark.parametrize(
@@ -103,7 +107,7 @@ def test_tracing_toggle_parses_common_boolean_spellings(
     value: str, expected: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.setenv("METEOBOT_TRACING", value)
+    monkeypatch.setenv("LANGSMITH_TRACING", value)
     assert load_settings().tracing_enabled is expected
 
 
@@ -149,7 +153,7 @@ def test_missing_api_key_is_a_config_error() -> None:
         ("METEOBOT_TOTAL_TOKENS_LIMIT", "0"),
         ("METEOBOT_LOG_LEVEL", "verbose"),
         ("METEOBOT_LOG_LEVEL", ""),
-        ("METEOBOT_TRACING", "maybe"),
+        ("LANGSMITH_TRACING", "maybe"),
     ],
 )
 def test_invalid_tunable_fails_fast_with_a_named_message(

@@ -28,7 +28,11 @@ from meteobot.agent import build_agent, make_run_turn
 from meteobot.config import Settings
 from meteobot.deps import Deps
 from meteobot.tools.weather import WeatherError, WeatherResult
-from meteobot.tracing import _traces_endpoint, build_instrumentation
+from meteobot.tracing import (
+    _langsmith_headers,
+    _traces_endpoint,
+    build_instrumentation,
+)
 
 
 def settings(**overrides: object) -> Settings:
@@ -36,28 +40,39 @@ def settings(**overrides: object) -> Settings:
         openai_api_key="test-key", model="gpt-4.1-mini", http_timeout_seconds=10.0,
         request_limit=6, total_tokens_limit=100_000, log_level="WARNING",
         tracing_enabled=False, langsmith_api_key=None,
-        langsmith_endpoint="https://example.test/otel", langsmith_project="meteobot",
+        langsmith_endpoint="https://example.test", langsmith_project="meteobot",
+        langsmith_workspace_id=None,
     )
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]
 
 
-def test_traces_endpoint_appends_the_signal_path_to_the_base() -> None:
-    # The OTLP HTTP exporter uses `endpoint=` verbatim, so the configured base
-    # URL must gain the traces signal path; posting to the bare `/otel` is a 403.
-    assert (
-        _traces_endpoint("https://api.smith.langchain.com/otel")
-        == "https://api.smith.langchain.com/otel/v1/traces"
+def test_traces_endpoint_derives_the_otlp_url_from_the_api_base() -> None:
+    full = "https://api.smith.langchain.com/otel/v1/traces"
+    # The LangSmith API base URL gains both the /otel collector path and the
+    # traces signal path; posting to a bare base or /otel is a 403.
+    assert _traces_endpoint("https://api.smith.langchain.com") == full
+    # Trailing slash tolerant, and idempotent whether given the base, the
+    # collector path, or the already-complete URL.
+    assert _traces_endpoint("https://api.smith.langchain.com/") == full
+    assert _traces_endpoint("https://api.smith.langchain.com/otel") == full
+    assert _traces_endpoint(full) == full
+
+
+def test_headers_carry_key_and_project_but_omit_workspace_when_unset() -> None:
+    headers = _langsmith_headers(
+        settings(langsmith_api_key="ls-secret", langsmith_workspace_id=None)
     )
-    # Idempotent and trailing-slash tolerant.
-    assert (
-        _traces_endpoint("https://api.smith.langchain.com/otel/")
-        == "https://api.smith.langchain.com/otel/v1/traces"
+    assert headers == {"x-api-key": "ls-secret", "Langsmith-Project": "meteobot"}
+
+
+def test_multi_workspace_key_adds_the_workspace_id_header() -> None:
+    # A key linked to more than one workspace is forbidden (403) without this;
+    # the header is what routes the trace to the right workspace.
+    headers = _langsmith_headers(
+        settings(langsmith_api_key="ls-secret", langsmith_workspace_id="ws-123")
     )
-    assert (
-        _traces_endpoint("https://api.smith.langchain.com/otel/v1/traces")
-        == "https://api.smith.langchain.com/otel/v1/traces"
-    )
+    assert headers["Langsmith-Workspace-Id"] == "ws-123"
 
 
 def test_tracing_off_returns_no_capability() -> None:
