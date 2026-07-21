@@ -19,8 +19,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 
-from meteobot.agent import Agent
-from meteobot.llm import History
+from meteobot.agent import History, RunTurn
 
 PROMPT = "\n> "
 WELCOME = (
@@ -33,10 +32,6 @@ INFRA_ERROR_LINE = (
     "that. Please try again."
 )
 QUIT_WORDS = frozenset({"quit", "exit"})
-
-# One Turn step: the user's text, the client-owned History (mutated in place),
-# and a per-delta render callback. `Agent.run_turn` satisfies this shape.
-RunTurn = Callable[[str, History, Callable[[str], None]], Awaitable[None]]
 
 
 async def run_repl(
@@ -74,7 +69,7 @@ async def run_repl(
             notify(INFRA_ERROR_LINE)
 
 
-async def start_repl(agent: Agent, history: History) -> None:
+async def start_repl(run_turn: RunTurn, history: History) -> None:
     """Wire real terminal I/O to `run_repl`. Untested edge (design-decision #10)."""
     import readline  # noqa: F401  (importing it enables line editing + history)
 
@@ -93,7 +88,7 @@ async def start_repl(agent: Agent, history: History) -> None:
 
     print(WELCOME, end="", flush=True)
     await run_repl(
-        run_turn=agent.run_turn,
+        run_turn=run_turn,
         history=history,
         read_input=read_input,
         render=render,

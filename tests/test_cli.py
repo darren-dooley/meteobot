@@ -12,11 +12,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 
 from meteobot.cli import INFRA_ERROR_LINE, run_repl
-from meteobot.llm import History
+
+# The loop tests treat History as an opaque list: run_repl only measures its
+# length and carries it into run_turn. Lightweight dict items stand in for the
+# real PydanticAI messages, whose shape is irrelevant to loop control flow.
+History = list[Any]
 
 
 @dataclass

@@ -1,1 +1,1 @@
-"""Tools the agent can call, plus the registry that assembles them."""
+"""Tools the agent can call: typed async functions registered at assembly."""
