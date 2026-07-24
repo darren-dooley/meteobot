@@ -30,6 +30,18 @@ DEFAULT_REQUEST_LIMIT = 6
 DEFAULT_TOTAL_TOKENS_LIMIT = 100_000
 DEFAULT_LOG_LEVEL = "WARNING"
 
+# Advanced tool-use defaults. Tool search attaches the demo MCP server as a
+# deferred (discoverable) toolset; code execution attaches the `run_python`
+# sandbox over the same server. Both default on; either can be turned off
+# independently. The executor is Docker by default and silently falls back to
+# in-process when Docker is unavailable (with a logged reason).
+DEFAULT_TOOL_SEARCH_ENABLED = True
+DEFAULT_CODE_EXEC_ENABLED = True
+DEFAULT_EXECUTOR = "docker"
+DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
+DEFAULT_CODE_EXEC_TIMEOUT_SECONDS = 30.0
+_EXECUTORS = frozenset({"docker", "inprocess"})
+
 # The LangSmith API base URL (LangSmith's own LANGSMITH_ENDPOINT convention).
 # The OTel collector lives at this base + "/otel"; tracing.py derives that.
 DEFAULT_LANGSMITH_ENDPOINT = "https://api.smith.langchain.com"
@@ -90,6 +102,17 @@ def _bool(name: str, default: bool) -> bool:
     raise ConfigError(f"{name} must be a boolean ({allowed}), got {raw!r}.")
 
 
+def _choice(name: str, default: str, allowed: frozenset[str]) -> str:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().casefold()
+    if value not in allowed:
+        options = ", ".join(sorted(allowed))
+        raise ConfigError(f"{name} must be one of {options}, got {raw!r}.")
+    return value
+
+
 def _log_level(name: str, default: str) -> str:
     raw = os.environ.get(name)
     if raw is None:
@@ -112,6 +135,14 @@ class Settings:
     request_limit: int
     total_tokens_limit: int
     log_level: str
+    # Advanced tool-use knobs. `executor` is honoured only when code execution is
+    # enabled; `sandbox_image`/`code_exec_timeout_seconds` configure the Docker
+    # executor.
+    tool_search_enabled: bool
+    code_exec_enabled: bool
+    executor: str
+    sandbox_image: str
+    code_exec_timeout_seconds: float
     tracing_enabled: bool
     langsmith_api_key: str | None
     langsmith_endpoint: str
@@ -152,6 +183,13 @@ def load_settings() -> Settings:
             "METEOBOT_TOTAL_TOKENS_LIMIT", DEFAULT_TOTAL_TOKENS_LIMIT
         ),
         log_level=_log_level("METEOBOT_LOG_LEVEL", DEFAULT_LOG_LEVEL),
+        tool_search_enabled=_bool("METEOBOT_TOOL_SEARCH", DEFAULT_TOOL_SEARCH_ENABLED),
+        code_exec_enabled=_bool("METEOBOT_CODE_EXEC", DEFAULT_CODE_EXEC_ENABLED),
+        executor=_choice("METEOBOT_EXECUTOR", DEFAULT_EXECUTOR, _EXECUTORS),
+        sandbox_image=os.environ.get("METEOBOT_SANDBOX_IMAGE", DEFAULT_SANDBOX_IMAGE),
+        code_exec_timeout_seconds=_positive_float(
+            "METEOBOT_CODE_EXEC_TIMEOUT", DEFAULT_CODE_EXEC_TIMEOUT_SECONDS
+        ),
         # LangSmith's own env-var conventions, so a standard LangSmith .env works.
         tracing_enabled=_bool("LANGSMITH_TRACING", False),
         langsmith_api_key=langsmith_api_key,

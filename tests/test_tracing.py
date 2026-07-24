@@ -39,6 +39,8 @@ def settings(**overrides: object) -> Settings:
     base: dict[str, object] = dict(
         openai_api_key="test-key", model="gpt-4.1-mini", http_timeout_seconds=10.0,
         request_limit=6, total_tokens_limit=100_000, log_level="WARNING",
+        tool_search_enabled=False, code_exec_enabled=False, executor="inprocess",
+        sandbox_image="python:3.12-slim", code_exec_timeout_seconds=30.0,
         tracing_enabled=False, langsmith_api_key=None,
         langsmith_endpoint="https://example.test", langsmith_project="meteobot",
         langsmith_workspace_id=None,

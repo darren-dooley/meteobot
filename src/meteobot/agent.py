@@ -28,13 +28,14 @@ from collections.abc import Awaitable, Callable
 from typing import Sequence
 
 from openai import AsyncOpenAI
-from pydantic_ai import Agent
+from pydantic_ai import Agent, Tool
 from pydantic_ai.capabilities import AgentCapability
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIResponsesModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.usage import UsageLimits
 
 from meteobot.config import Settings
@@ -56,6 +57,27 @@ INSTRUCTIONS = (
     "about current weather using the get_weather tool, calling it once per "
     "city. Answer plainly in a sentence or two per city."
 )
+
+# Appended to the base instructions when tool search and code execution are
+# wired in. Tells the model the extra capabilities exist and when to reach for
+# each, which is the single biggest lever on whether tool search gets used (the
+# deferred tools are invisible until it searches). Kept separate so a
+# weather-only build keeps the shorter prompt.
+CAPABILITY_INSTRUCTIONS = (
+    " Beyond weather you also have unit-conversion tools (temperature, wind "
+    "speed) that are hidden until you look for them: call search_tools with a "
+    "query like 'convert celsius to fahrenheit' to discover them, then call the "
+    "one you need. When a question needs several conversions or their results "
+    "combined, write one script for the run_python tool instead of many "
+    "separate calls."
+)
+
+
+def instructions_for(*, capabilities_enabled: bool) -> str:
+    """The system prompt, extended with capability guidance when features are on."""
+    if capabilities_enabled:
+        return INSTRUCTIONS + CAPABILITY_INSTRUCTIONS
+    return INSTRUCTIONS
 
 # Rendered when a usage limit trips — either the request limit (the framework's
 # Tool Round cap) or the token limit. Worded to be honest for both: the Turn did
@@ -81,23 +103,29 @@ def build_openai_model(
 
 def build_agent(
     model: Model,
-    tools: Sequence[Callable[..., object]],
+    tools: Sequence[Tool[Deps] | Callable[..., object]],
     *,
+    toolsets: Sequence[AbstractToolset[Deps]] = (),
     capabilities: Sequence[AgentCapability[Deps]] = (),
+    instructions: str = INSTRUCTIONS,
 ) -> Agent[Deps]:
     """Assemble the Turn-running agent from injected parts.
 
-    `tools` are typed async functions taking `RunContext[Deps]`; PydanticAI
-    derives each tool's JSON schema from its type hints. `capabilities` carries
-    optional instrumentation. This is the single composition point: adding a
-    tool means writing one typed function and passing it here.
+    `tools` are typed async functions (or `Tool` objects) taking
+    `RunContext[Deps]`; PydanticAI derives each tool's JSON schema from its type
+    hints. `toolsets` carries collections resolved per run — here the deferred
+    MCP toolset that tool search discovers into. `capabilities` carries optional
+    instrumentation and the `ToolSearch` capability. This is the single
+    composition point: adding a tool means writing one typed function and
+    passing it here.
     """
     return Agent(
         model=model,
         deps_type=Deps,
         name=AGENT_NAME,
-        instructions=INSTRUCTIONS,
+        instructions=instructions,
         tools=list(tools),
+        toolsets=list(toolsets),
         capabilities=list(capabilities),
     )
 

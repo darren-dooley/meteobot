@@ -10,10 +10,14 @@ to make the injected `Settings` reachable wherever a tool needs a tunable.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import httpx
 
 from meteobot.config import Settings
+
+if TYPE_CHECKING:
+    from meteobot.codeexec import Sandbox
 
 
 @dataclass
@@ -22,3 +26,8 @@ class Deps:
 
     http_client: httpx.AsyncClient
     settings: Settings
+    # The code-execution sandbox, present only when code execution is enabled and
+    # its MCP client is connected. `run_python` reads it here; every other tool
+    # ignores it. Optional with a default so existing call sites and tests that
+    # build a weather-only `Deps` keep working unchanged.
+    sandbox: "Sandbox | None" = None

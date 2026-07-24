@@ -7,12 +7,17 @@ from pathlib import Path
 import pytest
 
 from meteobot.config import (
+    DEFAULT_CODE_EXEC_ENABLED,
+    DEFAULT_CODE_EXEC_TIMEOUT_SECONDS,
+    DEFAULT_EXECUTOR,
     DEFAULT_HTTP_TIMEOUT_SECONDS,
     DEFAULT_LANGSMITH_ENDPOINT,
     DEFAULT_LANGSMITH_PROJECT,
     DEFAULT_LOG_LEVEL,
     DEFAULT_MODEL,
     DEFAULT_REQUEST_LIMIT,
+    DEFAULT_SANDBOX_IMAGE,
+    DEFAULT_TOOL_SEARCH_ENABLED,
     DEFAULT_TOTAL_TOKENS_LIMIT,
     ConfigError,
     MissingAPIKeyError,
@@ -26,6 +31,11 @@ MANAGED_VARS = (
     "METEOBOT_REQUEST_LIMIT",
     "METEOBOT_TOTAL_TOKENS_LIMIT",
     "METEOBOT_LOG_LEVEL",
+    "METEOBOT_TOOL_SEARCH",
+    "METEOBOT_CODE_EXEC",
+    "METEOBOT_EXECUTOR",
+    "METEOBOT_SANDBOX_IMAGE",
+    "METEOBOT_CODE_EXEC_TIMEOUT",
     "LANGSMITH_TRACING",
     "LANGSMITH_API_KEY",
     "LANGSMITH_ENDPOINT",
@@ -64,6 +74,35 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.langsmith_endpoint == DEFAULT_LANGSMITH_ENDPOINT
     assert settings.langsmith_project == DEFAULT_LANGSMITH_PROJECT
     assert settings.langsmith_workspace_id is None
+    # Advanced tool-use features default on, Docker executor.
+    assert settings.tool_search_enabled is DEFAULT_TOOL_SEARCH_ENABLED
+    assert settings.code_exec_enabled is DEFAULT_CODE_EXEC_ENABLED
+    assert settings.executor == DEFAULT_EXECUTOR
+    assert settings.sandbox_image == DEFAULT_SANDBOX_IMAGE
+    assert settings.code_exec_timeout_seconds == DEFAULT_CODE_EXEC_TIMEOUT_SECONDS
+
+
+def test_advanced_tool_use_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("METEOBOT_TOOL_SEARCH", "off")
+    monkeypatch.setenv("METEOBOT_CODE_EXEC", "off")
+    monkeypatch.setenv("METEOBOT_EXECUTOR", "inprocess")
+    monkeypatch.setenv("METEOBOT_SANDBOX_IMAGE", "python:3.13-slim")
+    monkeypatch.setenv("METEOBOT_CODE_EXEC_TIMEOUT", "12.5")
+    settings = load_settings()
+    assert settings.tool_search_enabled is False
+    assert settings.code_exec_enabled is False
+    assert settings.executor == "inprocess"
+    assert settings.sandbox_image == "python:3.13-slim"
+    assert settings.code_exec_timeout_seconds == 12.5
+
+
+def test_invalid_executor_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("METEOBOT_EXECUTOR", "firecracker")
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+    assert "METEOBOT_EXECUTOR" in str(excinfo.value)
 
 
 def test_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:

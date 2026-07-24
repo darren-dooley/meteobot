@@ -15,18 +15,36 @@ import sys
 import httpx
 from openai import AsyncOpenAI
 
+from pydantic_ai import Tool
+
 from meteobot.agent import (
     History,
     build_agent,
     build_openai_model,
+    instructions_for,
     make_run_turn,
     usage_limits_from,
 )
 from meteobot.cli import start_repl
 from meteobot.config import ConfigError, Settings, load_settings
 from meteobot.deps import Deps
+from meteobot.features import build_advanced_tooling, merge_capabilities
+from meteobot.tool_examples import with_examples
 from meteobot.tools.weather import get_weather
 from meteobot.tracing import build_instrumentation
+
+# get_weather with tool-use examples folded into its description: two calls that
+# show a plain city and a multi-word city, so the model sees the expected shape.
+WEATHER_TOOL = Tool(
+    get_weather,
+    name="get_weather",
+    description=with_examples(
+        "Get the current weather for one city by name. Call once per city when "
+        "several cities are asked about.",
+        "get_weather",
+        [{"city": "London"}, {"city": "San Francisco"}],
+    ),
+)
 
 
 async def _run(settings: Settings) -> None:
@@ -46,10 +64,21 @@ async def _run(settings: Settings) -> None:
             AsyncOpenAI(
                 api_key=settings.openai_api_key, http_client=http_client
             ) as openai_client,
+            build_advanced_tooling(settings) as advanced,
         ):
             model = build_openai_model(settings, openai_client)
-            agent = build_agent(model, [get_weather], capabilities=capabilities)
-            deps = Deps(http_client=http_client, settings=settings)
+            agent = build_agent(
+                model,
+                [WEATHER_TOOL, *advanced.extra_tools],
+                toolsets=advanced.toolsets,
+                capabilities=merge_capabilities(capabilities, advanced.capabilities),
+                instructions=instructions_for(capabilities_enabled=advanced.enabled),
+            )
+            deps = Deps(
+                http_client=http_client,
+                settings=settings,
+                sandbox=advanced.sandbox,
+            )
             run_turn = make_run_turn(agent, deps, usage_limits_from(settings))
 
             history: History = []
