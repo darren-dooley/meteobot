@@ -1,7 +1,10 @@
 """Configuration: a frozen Settings object read once at startup and injected everywhere.
 
 Values come from the environment; a `.env` file is loaded via python-dotenv
-without overriding variables already exported in the shell.
+without overriding variables already exported in the shell. Every tunable —
+the model, HTTP timeout, the usage limits that bound a Turn, the log level, and
+the LangSmith tracing knobs — lives here so operational config is discoverable
+in one place and a bad value names itself before any network call.
 """
 
 from __future__ import annotations
@@ -14,8 +17,38 @@ from dotenv import find_dotenv, load_dotenv
 
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
-DEFAULT_TOOL_ROUND_CAP = 5
+# The request limit is PydanticAI's framework-enforced replacement for v1's
+# hand-counted tool-round cap. It counts every model request in a Turn,
+# including the final answer, so it sits a little above the tool-round budget:
+# a normal multi-city question is one tool round (all cities concurrently) plus
+# one answer request. Six leaves room for a few re-plans and still cuts off a
+# runaway loop before it burns credits.
+DEFAULT_REQUEST_LIMIT = 6
+# A generous per-Turn token ceiling: a second guardrail so a confused model
+# can't run up cost even within the request budget. Far above any real weather
+# answer; present to bound the worst case, not to trim normal output.
+DEFAULT_TOTAL_TOKENS_LIMIT = 100_000
 DEFAULT_LOG_LEVEL = "WARNING"
+
+# Advanced tool-use defaults. Tool search attaches the demo MCP server as a
+# deferred (discoverable) toolset; code execution attaches the `run_python`
+# sandbox over the same server. Both default on; either can be turned off
+# independently. The executor is Docker by default and silently falls back to
+# in-process when Docker is unavailable (with a logged reason).
+DEFAULT_TOOL_SEARCH_ENABLED = True
+DEFAULT_CODE_EXEC_ENABLED = True
+DEFAULT_EXECUTOR = "docker"
+DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
+DEFAULT_CODE_EXEC_TIMEOUT_SECONDS = 30.0
+_EXECUTORS = frozenset({"docker", "inprocess"})
+
+# The LangSmith API base URL (LangSmith's own LANGSMITH_ENDPOINT convention).
+# The OTel collector lives at this base + "/otel"; tracing.py derives that.
+DEFAULT_LANGSMITH_ENDPOINT = "https://api.smith.langchain.com"
+DEFAULT_LANGSMITH_PROJECT = "meteobot"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSEY = frozenset({"0", "false", "no", "off", ""})
 
 
 class ConfigError(Exception):
@@ -56,6 +89,30 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().casefold()
+    if value in _TRUTHY:
+        return True
+    if value in _FALSEY:
+        return False
+    allowed = ", ".join(sorted(_TRUTHY | (_FALSEY - {""})))
+    raise ConfigError(f"{name} must be a boolean ({allowed}), got {raw!r}.")
+
+
+def _choice(name: str, default: str, allowed: frozenset[str]) -> str:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().casefold()
+    if value not in allowed:
+        options = ", ".join(sorted(allowed))
+        raise ConfigError(f"{name} must be one of {options}, got {raw!r}.")
+    return value
+
+
 def _log_level(name: str, default: str) -> str:
     raw = os.environ.get(name)
     if raw is None:
@@ -75,8 +132,24 @@ class Settings:
     openai_api_key: str
     model: str
     http_timeout_seconds: float
-    tool_round_cap: int
+    request_limit: int
+    total_tokens_limit: int
     log_level: str
+    # Advanced tool-use knobs. `executor` is honoured only when code execution is
+    # enabled; `sandbox_image`/`code_exec_timeout_seconds` configure the Docker
+    # executor.
+    tool_search_enabled: bool
+    code_exec_enabled: bool
+    executor: str
+    sandbox_image: str
+    code_exec_timeout_seconds: float
+    tracing_enabled: bool
+    langsmith_api_key: str | None
+    langsmith_endpoint: str
+    langsmith_project: str
+    # Required only when a LangSmith key is linked to more than one workspace,
+    # in which case the OTel ingest forbids the request without it (HTTP 403).
+    langsmith_workspace_id: str | None = None
 
 
 def load_settings() -> Settings:
@@ -97,14 +170,35 @@ def load_settings() -> Settings:
             "  OPENAI_API_KEY=sk-... uv run meteobot"
         )
 
+    langsmith_api_key = os.environ.get("LANGSMITH_API_KEY", "").strip() or None
+
     return Settings(
         openai_api_key=api_key,
         model=os.environ.get("METEOBOT_MODEL", DEFAULT_MODEL),
         http_timeout_seconds=_positive_float(
             "METEOBOT_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_SECONDS
         ),
-        tool_round_cap=_positive_int(
-            "METEOBOT_TOOL_ROUND_CAP", DEFAULT_TOOL_ROUND_CAP
+        request_limit=_positive_int("METEOBOT_REQUEST_LIMIT", DEFAULT_REQUEST_LIMIT),
+        total_tokens_limit=_positive_int(
+            "METEOBOT_TOTAL_TOKENS_LIMIT", DEFAULT_TOTAL_TOKENS_LIMIT
         ),
         log_level=_log_level("METEOBOT_LOG_LEVEL", DEFAULT_LOG_LEVEL),
+        tool_search_enabled=_bool("METEOBOT_TOOL_SEARCH", DEFAULT_TOOL_SEARCH_ENABLED),
+        code_exec_enabled=_bool("METEOBOT_CODE_EXEC", DEFAULT_CODE_EXEC_ENABLED),
+        executor=_choice("METEOBOT_EXECUTOR", DEFAULT_EXECUTOR, _EXECUTORS),
+        sandbox_image=os.environ.get("METEOBOT_SANDBOX_IMAGE", DEFAULT_SANDBOX_IMAGE),
+        code_exec_timeout_seconds=_positive_float(
+            "METEOBOT_CODE_EXEC_TIMEOUT", DEFAULT_CODE_EXEC_TIMEOUT_SECONDS
+        ),
+        # LangSmith's own env-var conventions, so a standard LangSmith .env works.
+        tracing_enabled=_bool("LANGSMITH_TRACING", False),
+        langsmith_api_key=langsmith_api_key,
+        langsmith_endpoint=os.environ.get(
+            "LANGSMITH_ENDPOINT", DEFAULT_LANGSMITH_ENDPOINT
+        ),
+        langsmith_project=os.environ.get(
+            "LANGSMITH_PROJECT", DEFAULT_LANGSMITH_PROJECT
+        ),
+        langsmith_workspace_id=os.environ.get("LANGSMITH_WORKSPACE_ID", "").strip()
+        or None,
     )

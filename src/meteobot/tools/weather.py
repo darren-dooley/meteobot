@@ -2,17 +2,30 @@
 
 One composed tool at the level of user intent — the model asks for a city and
 gets one structured result; it never sees coordinates or API plumbing.
+
+`fetch_weather` holds all the logic and is the tested unit: a plain async
+function over the shared httpx client, returning a typed `WeatherResult |
+WeatherError` union. `get_weather` is the thin PydanticAI adapter that reaches
+the shared client through the run's dependency-injection context and delegates.
+Every failure the model can act on comes back as a `WeatherError` value; the
+tool never raises, so one failing city can never abort the Turn or its siblings.
 """
 
 from __future__ import annotations
 
-from functools import partial
-from typing import Any, TypedDict
+from typing import Any, Literal
 
 import httpx
+from pydantic import BaseModel
+from pydantic_ai import RunContext
 
-from meteobot.tools.registry import Tool
-from meteobot.tools.results import ToolError
+from meteobot.deps import Deps
+
+# The closed set of Tool Error codes get_weather can return. Named so the model
+# and the tests share one explicit vocabulary rather than free-form strings.
+WeatherErrorCode = Literal[
+    "unknown_city", "weather_service_error", "tool_execution_error"
+]
 
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -58,7 +71,7 @@ WMO_CONDITIONS: dict[int, str] = {
 }
 
 
-class WeatherReport(TypedDict):
+class WeatherResult(BaseModel):
     """Current conditions for one resolved location."""
 
     location: str
@@ -72,27 +85,26 @@ class WeatherReport(TypedDict):
     conditions: str
 
 
-def weather_tool(http_client: httpx.AsyncClient) -> Tool:
-    """The get_weather declaration, with the shared HTTP client bound in."""
-    return Tool(
-        name="get_weather",
-        description=(
-            "Get the current weather for one city by name. "
-            "Call once per city when several cities are asked about."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "city": {
-                    "type": "string",
-                    "description": "City name as the user gave it, e.g. 'London'.",
-                }
-            },
-            "required": ["city"],
-            "additionalProperties": False,
-        },
-        handler=partial(get_weather, http_client=http_client),
-    )
+class WeatherError(BaseModel):
+    """A structured failure the model explains conversationally (a Tool Error).
+
+    Returned as data, never raised across the tool boundary, so the model can
+    tell the user what went wrong and a failed city leaves its siblings intact.
+    """
+
+    error: WeatherErrorCode
+    message: str
+    alternatives: list[str] = []
+
+
+async def get_weather(
+    ctx: RunContext[Deps], city: str
+) -> WeatherResult | WeatherError:
+    """Get the current weather for one city by name.
+
+    Call once per city when several cities are asked about.
+    """
+    return await fetch_weather(city, ctx.deps.http_client)
 
 
 def _display_name(place: dict[str, Any]) -> str:
@@ -100,31 +112,40 @@ def _display_name(place: dict[str, Any]) -> str:
     return ", ".join(p for p in parts if p)
 
 
-async def get_weather(
-    city: str, *, http_client: httpx.AsyncClient
-) -> WeatherReport | ToolError:
+async def fetch_weather(
+    city: str, http_client: httpx.AsyncClient
+) -> WeatherResult | WeatherError:
     """Geocode `city` and return its current conditions as one structured result.
 
-    Failures the LLM can act on come back as a structured ToolError, never
-    as a raised exception.
+    Every failure the LLM can act on — an unknown city, a weather-service
+    timeout or outage, or any unexpected error looking up this one city — comes
+    back as a structured WeatherError, never a raised exception. That keeps one
+    failing city from aborting the Turn or taking down its concurrent siblings.
     """
     try:
         return await _geocode_and_fetch(city, http_client)
     except httpx.TimeoutException:
-        return ToolError(
+        return WeatherError(
             error="weather_service_error",
             message=f"The weather service did not respond in time for {city!r}.",
         )
     except httpx.HTTPError:
-        return ToolError(
+        return WeatherError(
             error="weather_service_error",
             message=f"The weather service failed while looking up {city!r}.",
+        )
+    except Exception:
+        # A bug looking up one city is still just that city's failure: report it
+        # as a Tool Error so the model can move on rather than aborting the Turn.
+        return WeatherError(
+            error="tool_execution_error",
+            message=f"Something went wrong looking up the weather for {city!r}.",
         )
 
 
 async def _geocode_and_fetch(
     city: str, http_client: httpx.AsyncClient
-) -> WeatherReport | ToolError:
+) -> WeatherResult | WeatherError:
     geo_response = await http_client.get(
         GEOCODING_URL,
         params={"name": city, "count": 5, "language": "en", "format": "json"},
@@ -142,7 +163,7 @@ async def _geocode_and_fetch(
     )
     if place is None:
         alternatives = list(dict.fromkeys(_display_name(c) for c in candidates))
-        return ToolError(
+        return WeatherError(
             error="unknown_city",
             message=f"No place named {city!r} was found."
             + (" Did you mean one of these?" if alternatives else ""),
@@ -161,7 +182,7 @@ async def _geocode_and_fetch(
     current = forecast_response.json()["current"]
 
     code = current["weather_code"]
-    return WeatherReport(
+    return WeatherResult(
         location=_display_name(place),
         latitude=place["latitude"],
         longitude=place["longitude"],

@@ -1,35 +1,56 @@
-"""The agent loop: one streaming code path that orchestrates a Turn.
+"""Agent construction and the Turn adapter.
 
-All dependencies arrive by injection (LLM client, tool registry, settings);
-the loop consumes only the registry's schema list and dispatch function, and
-stays presentation-blind by forwarding text deltas to a renderer callback.
+v1 hand-wrote the model -> Tool Call -> model loop; v2 hands that surface to a
+PydanticAI `Agent`, which owns streaming, concurrent tool dispatch, tool-output
+validation, and the usage limit. Two things live here:
+
+- `build_agent` — assembles the `Agent` from an injected model, the tool
+  functions, and optional instrumentation capabilities. Tests inject a
+  `TestModel`/`FunctionModel` and stub tools where production injects the real
+  `OpenAIResponsesModel` and `get_weather`; the composition root is the only
+  place tools are registered.
+- `make_run_turn` — the thin adapter the REPL drives. It runs one streaming
+  Turn, forwards text deltas to the renderer, carries the History forward as
+  PydanticAI's own message list, and translates a tripped usage limit into the
+  same honest, user-facing message v1's round cap produced. It stays
+  presentation-blind: it renders text, nothing else.
+
+Only two exception classes matter at this seam. `UsageLimitExceeded` is the
+guardrail firing and is handled here as an in-Turn message. Anything else that
+escapes the run is an Infrastructure Error (LLM API down, bad credentials,
+transport failure) and is left to propagate to the REPL, which turns it into
+one friendly line and survives.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
-import logging
-import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from typing import Sequence
 
-from openai.types.responses import ResponseFunctionToolCall
+from openai import AsyncOpenAI
+from pydantic_ai import Agent, Tool
+from pydantic_ai.capabilities import AgentCapability
+from pydantic_ai.exceptions import UsageLimitExceeded
+from pydantic_ai.messages import ModelMessage
+from pydantic_ai.models import Model
+from pydantic_ai.models.openai import OpenAIResponsesModel
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.toolsets import AbstractToolset
+from pydantic_ai.usage import UsageLimits
 
 from meteobot.config import Settings
-from meteobot.llm import History, LLMClient
-from meteobot.tools.registry import ToolRegistry
-from meteobot.tools.results import ToolError, ToolResult
+from meteobot.deps import Deps
 
-# One line per seam at INFO, keyed by nothing (single process, single
-# conversation); configured to stderr at the composition root. See
-# design-decisions.md #14.
-logger = logging.getLogger(__name__)
+# History is PydanticAI's own client-owned message list: the messages from one
+# Turn are appended and carried into the next as `message_history`, so
+# multi-turn follow-ups fall out for free and the record stays inspectable.
+type History = list[ModelMessage]
 
-ROUND_CAP_MESSAGE = (
-    "I've hit my limit of weather lookups for this question, so I have to "
-    "stop here. Try again with fewer places or a more specific question."
-)
+# One Turn step: the user's text, the client-owned History (mutated in place),
+# and a per-delta render callback.
+type RunTurn = Callable[[str, History, Callable[[str], None]], Awaitable[None]]
+
+AGENT_NAME = "meteobot"
 
 INSTRUCTIONS = (
     "You are meteobot, a concise CLI weather assistant. Answer questions "
@@ -37,114 +58,120 @@ INSTRUCTIONS = (
     "city. Answer plainly in a sentence or two per city."
 )
 
+# Appended to the base instructions when tool search and code execution are
+# wired in. Tells the model the extra capabilities exist and when to reach for
+# each, which is the single biggest lever on whether tool search gets used (the
+# deferred tools are invisible until it searches). Kept separate so a
+# weather-only build keeps the shorter prompt.
+CAPABILITY_INSTRUCTIONS = (
+    " Beyond weather you also have unit-conversion tools (temperature, wind "
+    "speed) that are hidden until you look for them: call search_tools with a "
+    "query like 'convert celsius to fahrenheit' to discover them, then call the "
+    "one you need. When a question needs several conversions or their results "
+    "combined, write one script for the run_python tool instead of many "
+    "separate calls."
+)
 
-@dataclass(frozen=True)
-class Agent:
-    """Runs Turns against injected LLM, tools, and settings."""
 
-    llm: LLMClient
-    registry: ToolRegistry
-    settings: Settings
+def instructions_for(*, capabilities_enabled: bool) -> str:
+    """The system prompt, extended with capability guidance when features are on."""
+    if capabilities_enabled:
+        return INSTRUCTIONS + CAPABILITY_INSTRUCTIONS
+    return INSTRUCTIONS
+
+# Rendered when a usage limit trips — either the request limit (the framework's
+# Tool Round cap) or the token limit. Worded to be honest for both: the Turn did
+# too much work to finish, whichever guardrail fired.
+ROUND_CAP_MESSAGE = (
+    "I've hit my limit for this question, so I have to stop here. Try again "
+    "with fewer places or a more specific question."
+)
+
+
+def build_openai_model(
+    settings: Settings, openai_client: AsyncOpenAI
+) -> OpenAIResponsesModel:
+    """The production model seam: OpenAI's Responses API over the shared client.
+
+    Kept here so the composition root and the live e2e test build the model the
+    same way; offline tests inject a `TestModel`/`FunctionModel` in its place.
+    """
+    return OpenAIResponsesModel(
+        settings.model, provider=OpenAIProvider(openai_client=openai_client)
+    )
+
+
+def build_agent(
+    model: Model,
+    tools: Sequence[Tool[Deps] | Callable[..., object]],
+    *,
+    toolsets: Sequence[AbstractToolset[Deps]] = (),
+    capabilities: Sequence[AgentCapability[Deps]] = (),
+    instructions: str = INSTRUCTIONS,
+) -> Agent[Deps]:
+    """Assemble the Turn-running agent from injected parts.
+
+    `tools` are typed async functions (or `Tool` objects) taking
+    `RunContext[Deps]`; PydanticAI derives each tool's JSON schema from its type
+    hints. `toolsets` carries collections resolved per run — here the deferred
+    MCP toolset that tool search discovers into. `capabilities` carries optional
+    instrumentation and the `ToolSearch` capability. This is the single
+    composition point: adding a tool means writing one typed function and
+    passing it here.
+    """
+    return Agent(
+        model=model,
+        deps_type=Deps,
+        name=AGENT_NAME,
+        instructions=instructions,
+        tools=list(tools),
+        toolsets=list(toolsets),
+        capabilities=list(capabilities),
+    )
+
+
+def make_run_turn(
+    agent: Agent[Deps], deps: Deps, usage_limits: UsageLimits
+) -> RunTurn:
+    """Build the REPL's Turn adapter around a constructed agent and its deps."""
 
     async def run_turn(
-        self, user_input: str, history: History, render: Callable[[str], None]
+        user_input: str, history: History, render: Callable[[str], None]
     ) -> None:
-        """Run one Turn: stream the answer, executing Tool Rounds as needed.
+        """Run one streaming Turn, appending its messages to `history`.
 
-        Appends everything the Turn produces to the client-owned `history`.
+        A tripped usage limit ends the Turn with an honest message rather than
+        raising past the REPL; every other failure propagates as an
+        Infrastructure Error for the REPL to catch.
         """
-        logger.info("turn start: %r", user_input)
-        history.append({"role": "user", "content": user_input})
-
-        rounds_used = 0
-        while True:
-            text_parts: list[str] = []
-            tool_calls: list[ResponseFunctionToolCall] = []
-            async for event in self.llm.stream(
-                model=self.settings.model,
-                instructions=INSTRUCTIONS,
-                tools=self.registry.schemas(),
-                input=history,
-            ):
-                if event.type == "response.output_text.delta":
-                    render(event.delta)
-                    text_parts.append(event.delta)
-                elif (
-                    event.type == "response.output_item.done"
-                    and event.item.type == "function_call"
-                ):
-                    tool_calls.append(event.item)
-
-            if text_parts:
-                history.append({"role": "assistant", "content": "".join(text_parts)})
-            if not tool_calls:
-                return
-
-            # Cap check happens before the round runs, so History never holds
-            # a function_call without its output.
-            if rounds_used >= self.settings.tool_round_cap:
-                logger.warning(
-                    "tool round cap reached (%d); ending turn",
-                    self.settings.tool_round_cap,
-                )
-                render(ROUND_CAP_MESSAGE)
-                history.append({"role": "assistant", "content": ROUND_CAP_MESSAGE})
-                return
-
-            rounds_used += 1
-            logger.info(
-                "tool round %d: %d call(s) %s",
-                rounds_used,
-                len(tool_calls),
-                [call.name for call in tool_calls],
-            )
-            await self._run_tool_round(tool_calls, history)
-
-    async def _run_tool_round(
-        self, tool_calls: list[ResponseFunctionToolCall], history: History
-    ) -> None:
-        """Execute one Tool Round: dispatch all Tool Calls concurrently and
-        append each call and its result to History."""
-        for call in tool_calls:
-            history.append(
-                {
-                    "type": "function_call",
-                    "call_id": call.call_id,
-                    "name": call.name,
-                    "arguments": call.arguments,
-                }
-            )
-        results = await asyncio.gather(
-            *(self._dispatch(call) for call in tool_calls)
-        )
-        for call, result in zip(tool_calls, results, strict=True):
-            history.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": call.call_id,
-                    "output": json.dumps(result),
-                }
-            )
-
-    async def _dispatch(self, call: ResponseFunctionToolCall) -> ToolResult:
-        """Run one Tool Call, capturing any escaped exception as a Tool Error
-        so one failing call never takes down its siblings or the Turn."""
-        start = time.perf_counter()
         try:
-            arguments: dict[str, object] = json.loads(call.arguments)
-            result: ToolResult = await self.registry.dispatch(call.name, arguments)
-        except Exception:
-            result = ToolError(
-                error="tool_execution_error",
-                message=f"The {call.name} tool failed unexpectedly for this call.",
-            )
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        status = f"error:{result['error']}" if "error" in result else "ok"
-        logger.info(
-            "tool call %s(%s) -> %s in %.1f ms",
-            call.name,
-            call.arguments,
-            status,
-            elapsed_ms,
-        )
-        return result
+            async with agent.run_stream(
+                user_input,
+                message_history=list(history),
+                deps=deps,
+                usage_limits=usage_limits,
+            ) as result:
+                async for delta in result.stream_text(delta=True):
+                    render(delta)
+                new_messages = result.new_messages()
+            history.extend(new_messages)
+        except UsageLimitExceeded:
+            # A capped Turn is abandoned, not recorded: the honest message is
+            # rendered to the user, and this incomplete Turn's messages are
+            # deliberately not carried into History so the next Turn starts clean.
+            render(ROUND_CAP_MESSAGE)
+
+    return run_turn
+
+
+def usage_limits_from(settings: Settings) -> UsageLimits:
+    """The Turn's guardrails as a declared PydanticAI policy.
+
+    A request limit caps the model -> Tool Call -> model Tool Rounds (v1's round
+    cap, now framework-enforced); a token limit bounds worst-case cost even
+    within that request budget.
+    """
+    return UsageLimits(
+        request_limit=settings.request_limit,
+        total_tokens_limit=settings.total_tokens_limit,
+    )

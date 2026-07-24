@@ -1,76 +1,112 @@
 ---
-title: meteobot — CLI weather assistant
+title: meteobot v2 — productionised on PydanticAI + LangSmith
 labels: [ready-for-agent]
 ---
 
-# PRD: meteobot
+# PRD: meteobot v2 (PydanticAI + LangSmith)
 
-Vocabulary used below is defined in `CONTEXT.md` (Turn, Tool Round, Tool Call, History, Tool Error, Infrastructure Error). Decision rationale lives in `design-decisions.md`; deferred work in `what-happens-next.md`.
+Vocabulary used below is defined in `CONTEXT.md` (Turn, Tool Round, Tool Call, History, Tool Error, Infrastructure Error).
+
+This is a rewrite of meteobot's core, not an incremental change. v1 hand-wrote the agent loop, an `LLMClient` Protocol seam, and a bespoke `ToolRegistry`. v2 replaces all three with [PydanticAI](https://ai.pydantic.dev) so the loop is a maintained dependency rather than owned code, and instruments every Turn in [LangSmith](https://smith.langchain.com) over OpenTelemetry. The user-facing behaviour of v1 is preserved exactly; the machinery underneath changes.
 
 ## Problem Statement
 
-Checking the weather for one or several places means leaving the terminal, opening a browser or app, and running one search per city. There is no way to ask a plain-English question like "what's the weather in London and Tokyo right now?" from the command line and get one live, readable answer. meteobot is also a small, runnable reference for structuring an LLM agent with real tool calls, async concurrency, and streaming.
+meteobot v1 works, but its agent loop, LLM adapter, and tool registry are all hand-written. That is fine as a reference POC and wrong as a production posture: the loop, streaming accumulation, round cap, tool dispatch, and error capture are meteobot's code to maintain and get right, when a mature framework already owns exactly that surface. There is also no production-grade observability — the only window into the probabilistic agent loop is level-gated `logging` lines on stderr, which do not survive as traces, cannot be searched, and give no token or latency aggregation across Turns. To run this as a real assistant, and to be able to answer "what did the model actually do on that Turn?" after the fact, the orchestration should be a maintained dependency and every Turn should be a searchable trace.
 
 ## Solution
 
-meteobot: an interactive terminal assistant. The user types a natural-language question; an LLM decides whether it needs live data and issues one Tool Call per city, which fetch current conditions from Open-Meteo concurrently; the LLM then streams a single friendly answer token-by-token. The conversation is multi-turn (follow-ups like "and Paris?" work), survives bad input and provider failures, and exits on `quit` or `exit`. Setup is clone, provide an OpenAI key, run one command.
+meteobot v2 keeps the same interactive terminal experience — ask a plain-English weather question, get one live streamed answer, multi-turn follow-ups, survives bad input and provider failure, exits on `quit`/`exit` — but rebuilt on PydanticAI. A single PydanticAI `Agent` owns the Turn: it runs the model → Tool Call → model cycle, validates Tool Call arguments and tool outputs against Pydantic models, streams the final answer token-by-token, and enforces a usage limit in place of the hand-counted round cap. The `get_weather` tool becomes a typed async function reached through the framework's dependency-injection context. Every Turn emits OpenTelemetry spans that ship to LangSmith, giving per-Turn, per-Tool-Call, per-token traces with latency and cost. Setup is unchanged in spirit: clone, provide an OpenAI key (and optionally a LangSmith key), run one command.
 
 ## User Stories
+
+### Preserved user-facing behaviour (from v1)
 
 1. As a terminal user, I want to ask weather questions in natural language, so that I don't have to learn a query syntax.
 2. As a terminal user, I want the assistant to fetch live weather data when my question needs it, so that answers reflect current conditions rather than the model's training data.
 3. As a terminal user, I want to mention several cities in one message and get one unified answer, so that I don't have to ask city by city.
 4. As a terminal user, I want multi-city lookups to run concurrently, so that three cities don't take three times as long.
-5. As a terminal user, I want the answer to appear token-by-token as it is generated, so that I see progress immediately instead of staring at a silent prompt.
+5. As a terminal user, I want the answer to appear token-by-token as it is generated, so that I see progress immediately.
 6. As a terminal user, I want follow-up questions to use conversation context, so that "what about tomorrow?" or "and in Paris?" work naturally.
-7. As a terminal user, I want a misspelled or unknown city explained conversationally, with likely alternatives when the name is ambiguous, so that I can correct myself and move on.
+7. As a terminal user, I want a misspelled or unknown city explained conversationally, with likely alternatives when the name is ambiguous, so that I can correct myself.
 8. As a terminal user, I want one invalid city to leave the other cities' results intact, so that a single typo doesn't spoil the whole question.
-9. As a terminal user, I want a weather-service timeout or failure for one city reported in plain language within the answer, so that I know what happened without seeing a stack trace.
+9. As a terminal user, I want a weather-service timeout or failure for one city reported in plain language within the answer, so that I know what happened without a stack trace.
 10. As a terminal user, I want the session to survive an LLM provider outage or network failure with a one-line message, so that a transient failure doesn't kill my conversation.
-11. As a terminal user, I want questions that don't need weather data answered directly without spurious lookups, so that the assistant feels sensible rather than mechanical.
-12. As a terminal user, I want to exit by typing `quit` or `exit`, so that leaving the app is obvious.
-13. As a terminal user, I want arrow-key line editing and in-session input history, so that correcting and repeating questions is painless.
-14. As a terminal user, I want answers in plain text suited to a terminal, so that markdown symbols don't litter the output.
-15. As a terminal user, I want a clear startup message when my API key is missing, so that I can fix my environment before anything else happens.
-16. As a terminal user, I want a runaway sequence of Tool Rounds cut off with an honest message, so that a confused model can't hang my session or burn my credits indefinitely.
-17. As a new user, I want to clone the repo, provide a key via `.env` or an environment variable, and start the app with a single documented command, so that first run succeeds without troubleshooting.
-18. As a reader of the codebase, I want a README explaining the design decisions and the named scope cuts with reasoning, so that I can understand the judgment calls, not just the code.
-19. As a contributor, I want to run the test suite offline with no API key, so that I can verify behavior without spending money.
-20. As a contributor, I want an opt-in live end-to-end test against the real APIs, so that I can confirm the integration genuinely works.
-21. As a contributor, I want type hints and clear function signatures throughout, so that the code reads without archaeology.
-22. As a developer extending meteobot, I want to add a new tool by registering it in one place, so that the agent loop and CLI never change when capabilities grow.
-23. As a developer, I want all tunables (model, timeouts, round cap) in one injected configuration object with environment overrides, so that operational knobs are discoverable and changeable without code edits.
-24. As a developer, I want Tool Errors returned as structured data rather than raised across the tool boundary, so that failure handling is a contract I can test.
-25. As a developer, I want mechanical retries confined to the transport and SDK layers, so that transient network blips never become LLM re-planning or user-visible noise.
-26. As a developer, I want the History inspectable client-side, so that "what did the model actually see?" is answerable during debugging.
-27. As a developer, I want mocked tests built on fixtures captured from the real APIs, so that my fakes can't drift from the wire formats they imitate.
-28. As a developer, I want the agent's steps — Turn start, each Tool Round's chosen Tool Calls, each Tool Call's name, arguments, latency, and error status, and cap hits — logged to stderr at a configurable level, so that I can debug the probabilistic agent loop without a tracing platform and without the logs polluting the streamed answer on stdout.
+11. As a terminal user, I want questions that don't need weather data answered directly without spurious lookups.
+12. As a terminal user, I want to exit by typing `quit` or `exit`.
+13. As a terminal user, I want arrow-key line editing and in-session input history.
+14. As a terminal user, I want answers in plain text suited to a terminal.
+15. As a terminal user, I want a clear startup message when my API key is missing, so that I can fix my environment first.
+16. As a terminal user, I want a runaway sequence of Tool Rounds cut off with an honest message, so that a confused model can't hang my session or burn credits.
+17. As a new user, I want to clone the repo, provide a key via `.env` or an environment variable, and start with one documented command.
+
+### New in v2 — framework and observability
+
+18. As the maintainer, I want the Turn's model → Tool Call → model loop owned by PydanticAI, so that streaming, tool dispatch, and iteration control are a maintained dependency rather than meteobot's code.
+19. As the maintainer, I want the round cap expressed as a PydanticAI usage limit, so that "won't hang or burn credits" is a declared policy the framework enforces, not a hand-counted loop variable.
+20. As the maintainer, I want `get_weather` to be a typed async function whose arguments and result are validated by Pydantic, so that malformed Tool Calls are rejected at the boundary before my code runs.
+21. As the maintainer, I want the Tool Error tier expressed as a typed union result (`WeatherResult | WeatherError`), so that a failed city is structured data the model explains and my tests assert on, with siblings preserved.
+22. As the maintainer, I want the Infrastructure Error tier still caught at the REPL, so that a provider outage or bad key surfaces as one friendly line and the REPL survives.
+23. As an operator, I want every Turn to emit OpenTelemetry spans that reach LangSmith, so that I can see each Turn, its Tool Calls, arguments, latency, tokens, and cost as a searchable trace instead of ephemeral stderr lines.
+24. As an operator, I want tracing to be toggleable by configuration and to fail open, so that a missing LangSmith key or an unreachable collector degrades to a normal local session rather than breaking the app.
+25. As an operator, I want no secrets (API keys) present in trace payloads or span attributes, so that turning on tracing is safe.
+26. As a developer, I want all tunables — model, HTTP timeout, usage limits, log level, LangSmith key/endpoint/project, tracing toggle — in one frozen injected `Settings` object with environment overrides and fail-fast validation, so that operational knobs are discoverable and a bad value names itself.
+27. As a developer, I want the History carried as PydanticAI's message list and still fully client-owned and inspectable, so that "what did the model see?" is answerable and multi-turn falls out for free.
+28. As a developer, I want the OpenAI Responses API preserved via PydanticAI's `OpenAIResponsesModel`, so that v1's deliberate choice (dependable parallel function calling, no reasoning preamble) carries forward.
+29. As a developer, I want to test the whole agent loop offline with PydanticAI's `TestModel`/`FunctionModel`, so that I can verify concurrent Tool Call dispatch, History growth, the usage-limit trip, and direct-answer Turns without an API key or spend.
+30. As a developer, I want the weather tool tested against captured Open-Meteo wire fixtures through the shared client's mock transport, so that my fakes can't drift from the real format.
+31. As a developer, I want one opt-in live end-to-end test against both real APIs, so that I can confirm the integration genuinely works.
+32. As a developer extending meteobot, I want to add a tool by writing one typed async function and registering it at the composition root, so that the agent construction is the only place that changes.
 
 ## Implementation Decisions
 
-- **Name and packaging**: the project is named `meteobot` — package name, console script, and README title. Distributed as a uv-managed Python package with a committed lockfile and a console-script entry point; the install path is clone → provide key → `uv run meteobot`.
-- **Module decomposition**: four concerns, separately housed — CLI (input loop and rendering), agent (LLM orchestration), tools (registry plus the weather tool), and config. No hexagonal layering; it would be over-engineering at this scale.
-- **Agent loop**: one streaming code path with a bounded loop. Every LLM call streams; text deltas go to the renderer as they arrive, Tool Calls accumulate. If a Turn's response contains Tool Calls, they execute concurrently, results append to the History, and the loop calls again — capped at ~5 Tool Rounds per Turn, with the cap surfaced honestly to the user if hit. No special-casing of tool-only turns, chained rounds, or direct answers.
-- **LLM interface**: OpenAI Responses API via the official SDK, model `gpt-4.1-mini` by default — chosen for dependable parallel function calling and no reasoning preamble (first token streams immediately). Model is configuration, env-overridable, never a hardcoded constant.
-- **Conversation state**: a client-owned History list passed in full on every call; no server-side state (`previous_response_id` rejected: opaque, vendor-locked, no cost saving). Multi-turn support falls out of this for free.
-- **Tool shape**: a single composed `get_weather(city)` tool — geocoding then current-conditions fetch happen inside the tool, which returns one structured result. Multiple cities in one message become multiple parallel Tool Calls. Tools sit at the level of user intent, not API plumbing; the model is never given coordinates to hallucinate.
-- **Tool registry**: the extensibility seam. Each tool is a declaration (name, description, parameter schema, async handler); the registry is a plain value assembled explicitly at the composition root and injected into the agent, which consumes only the registry's schema list and dispatch function and never knows which tools exist. No import-time self-registration: adding a tool means adding one entry at assembly. This is also where future middleware (per-tool timeouts, retries, tracing, MCP-backed handlers) would attach.
-- **HTTP layer**: httpx with one shared async client created at the composition root and injected into tools — connection pooling across the concurrent fan-out, timeout and connect-retry policy configured once. The SDK retries its own calls; the LLM is allowed to re-plan after a Tool Error but is never the retry mechanism.
-- **Input loop**: the blocking terminal read is pushed onto a worker thread and awaited, keeping the event loop free of blocking calls; readline gives line editing and in-session history for free.
-- **Rendering**: plain flushed writes per text delta behind a tiny renderer function; the agent loop is presentation-blind. Decided by prototype: a transient status line during Tool Rounds costs a spinner thread, cursor-control escape codes, and real teardown for negligible value. The system prompt asks the model for plain text.
-- **Error routing**: two tiers. Tool Errors (unknown city, weather-service timeout or failure) are caught inside the tool and returned as structured results the model explains conversationally; per-call capture around concurrent Tool Calls preserves sibling results. Infrastructure Errors (LLM API failure, bad credentials) are caught at the CLI loop: one friendly line, the Turn is abandoned, the REPL survives.
-- **Configuration**: a frozen settings object read once at startup and injected — API key (fail-fast with a clear message if absent, passed explicitly to the SDK client), model, HTTP timeout, round cap, and log level. `.env` loaded via python-dotenv without overriding exported variables; README documents both the `.env` path and an inline-env fallback command. Invalid tunables (non-numeric or out-of-range timeout/cap) fail fast with the offending variable named, not a raw parse traceback.
-- **Debug logging**: stdlib `logging` to stderr, level-gated via `METEOBOT_LOG_LEVEL` (default `WARNING`, quiet in a normal session; `INFO` surfaces the per-step trace). One line at each existing seam — Turn start, the Tool Calls a Tool Round chose, and each Tool Call's name/args/latency/error — all at `INFO`. A cap hit is the exception: it logs at `WARNING`, since a runaway sequence tripping the cap is an anomaly worth seeing even in a quiet default session. So the default level shows only cap trips; `INFO` adds the full per-step trace. stderr, never stdout, so logs never interleave with the streamed answer or break a `> answer.txt` redirect; the app writes no file, since a file is a redirect (`2> run.log`) the operator owns, not app machinery. This is the minimal in-scope slice for debugging the agent loop; the service-grade version (structured JSON keyed by conversation/turn, OTel tracing spans at the dispatch seam, token/cost and latency metrics, log aggregation) stays deferred in `what-happens-next.md`.
+- **Framework choice — PydanticAI, not LangGraph.** The Turn is a linear single-tool loop; a graph/checkpointer engine would be over-sized machinery for it. PydanticAI is the right-sized tool: it owns the model → Tool Call → model loop, typed tools, streaming, and usage limits, which is exactly the surface v1 hand-wrote. LangGraph is deliberately out of scope (see Out of Scope) and the rationale is part of the design's defensible story.
+
+- **Agent construction.** A single PydanticAI `Agent` is built at the composition root with `OpenAIResponsesModel` (model `gpt-4.1-mini`, env-overridable), the `get_weather` tool, an instructions/system prompt equivalent to v1's, and `instrument=True`. The bespoke agent loop (`agent.py`) and the `LLMClient` Protocol + `OpenAIResponsesLLM` adapter (`llm.py`) are removed; PydanticAI's own `Model` abstraction is the new seam.
+
+- **Tool shape — PydanticAI idiom.** `ToolRegistry` and the `Tool` dataclass are removed. `get_weather` becomes a typed async function registered via the agent's tool list at the composition root; PydanticAI generates the JSON schema from the type hints. Extensibility is preserved as "add one typed function and register it at assembly," at the same single composition point v1 used. It remains one composed tool at the level of user intent (geocode + current-conditions fetch inside the tool); the model never sees coordinates.
+
+- **Dependency injection.** A `Deps` dataclass carries the shared `httpx.AsyncClient` and the `Settings`, passed on the agent run and reached inside `get_weather` through PydanticAI's `RunContext`. This preserves v1's "one shared pooled client, timeout and connect-retry configured once, injected into tools" decision. The httpx client is still created once at the composition root inside an `async with`.
+
+- **Tool Error tier — typed union output.** `get_weather` returns `WeatherResult | WeatherError`, both Pydantic models (replacing the `WeatherReport`/`ToolError` TypedDicts). The model receives the structured error in the tool result and explains it conversationally; per-call capture inside the tool means one failing city never takes down its siblings. `ModelRetry` is deliberately not used here — an unknown city is a fact to report, not a prompt to retry, and retrying would burn a round for the wrong reason.
+
+- **Infrastructure Error tier — unchanged routing.** Failures only the user can act on (LLM API down, bad credentials, transport failure) escape the agent run and are caught at the REPL: one friendly line, the Turn is abandoned, the REPL survives. Never shown to the model.
+
+- **Runtime guardrails.** The hand-counted `tool_round_cap` is replaced by PydanticAI `UsageLimits` (a request limit, plus a token limit), enforced by the framework; when the limit trips, the Turn ends with an honest message to the user, matching v1's cap behaviour. Per-tool timeout and connect-retry remain a property of the shared httpx client (httpx does not retry by default; connect-only retry preserved). Mechanical retries stay confined to the transport/SDK layer; the model is allowed to re-plan after a Tool Error but is never the retry mechanism.
+
+- **Conversation state / History.** Client-owned PydanticAI message history: the message list from one run is passed as `message_history` into the next, giving multi-turn follow-ups for free and keeping the record fully inspectable client-side. No server-side conversation state.
+
+- **Rendering / REPL.** `cli.py`'s structure is kept: `run_repl` (the tested control-flow and error-routing loop) and `start_repl` (the untested terminal-I/O edge — worker-thread blocking read, `readline` line editing, flushed per-delta writes). Only the injected `run_turn` adapter changes: it drives the PydanticAI agent's streaming run and forwards text deltas to the existing renderer callback. The agent stays presentation-blind. It remains a local interactive REPL — not a server; "deploy" here means installable/runnable, not hosted.
+
+- **Configuration.** The frozen `Settings` object is extended: existing fields (OpenAI key with fail-fast message, model, HTTP timeout, log level) plus usage-limit tunables, LangSmith API key, OTLP endpoint, project name, and a tracing on/off toggle. `.env` loaded via python-dotenv without overriding exported variables; invalid tunables fail fast naming the offending variable. Tracing config is optional: absent LangSmith key with tracing on degrades to a warning and a normal local session, never a crash.
+
+- **LangSmith over OpenTelemetry.** PydanticAI's native instrumentation (`instrument=True`) emits OTel spans; an OTLP/HTTP exporter is pointed at LangSmith's OTel endpoint (`https://api.smith.langchain.com/otel`) with the API key and project supplied via headers. No LangChain dependency and no double-instrumentation. This is the production observability path; the v1 stderr `logging` lines may remain as an offline fallback but are no longer the primary trace. Secrets are never placed in span attributes.
 
 ## Testing Decisions
 
-- **What makes a good test here**: assert on external behavior at a seam — the structured result a tool returns, the sequence of calls a fake LLM sees, the History shape after a Turn — never on internals like private helpers or call counts of implementation details. Fakes stand in for vendors; the code under test is always real.
-- **Methodology**: TDD (red-green-refactor) for the deterministic layers, driving implementation of the tool contract and agent loop mechanics.
-- **Two seams, both pre-existing in the design**:
-  - *HTTP transport seam*: the shared injected client accepts a mock transport, so weather-tool tests exercise real tool code against canned HTTP responses — happy path, unknown city → structured Tool Error, timeout → structured Tool Error.
-  - *LLM client seam*: the agent accepts a fake client exposing the same streaming surface as the real SDK, replaying scripted event sequences — verifying concurrent Tool Call dispatch, History growth, round-cap trip, and direct-answer Turns.
-- **Realistic fixtures**: mock responses and streamed event sequences are captured from the real Open-Meteo and Responses APIs, not invented, so fixtures can't drift from the wire format.
-- **Live e2e test**: one opt-in test against both real APIs (multi-city question → streamed answer), marked so it runs only on explicit request with a key present and is excluded from the default suite.
-- **Deliberately untested**: CLI input/rendering (fake-TTY fiddliness, near-zero signal) and the LLM's judgment beyond the e2e smoke check (evals territory, named as such in the README).
-- **Prior art**: none — greenfield repo; these tests establish the project's patterns.
+- **What makes a good test here.** Assert on external behaviour at a seam — the typed result a tool returns, the sequence of Tool Calls the model seam is driven to make, the History/message shape after a Turn — never on framework internals or private helpers. Fakes stand in for vendors; the code under test (tool logic, REPL control flow, config parsing, agent wiring) is always real.
 
+- **Model seam — PydanticAI `TestModel`/`FunctionModel`.** The agent-loop tests inject a `TestModel` or a `FunctionModel` where production injects `OpenAIResponsesModel`, replaying scripted model behaviour: concurrent Tool Call dispatch across multiple cities, History/message growth across a Turn, the `UsageLimits` trip surfacing the honest message, and a direct-answer Turn with no Tool Call. This replaces v1's hand-rolled fake `LLMClient`; it is the highest seam for loop mechanics and the same seam count as before.
+
+- **HTTP transport seam — unchanged.** The shared injected `httpx.AsyncClient` accepts a `MockTransport`, so `get_weather` runs real code against canned Open-Meteo responses: happy path, unknown/misspelled city → structured `WeatherError` with alternatives, timeout → structured `WeatherError`.
+
+- **Realistic fixtures.** The Open-Meteo geocoding/forecast fixtures carry over unchanged (captured from the real API). Scripted model behaviour is expressed through PydanticAI's test models rather than replayed raw Responses wire events; where captured Responses fixtures still encode a useful shape they inform the scripts.
+
+- **Live e2e test.** One opt-in test drives the real `Agent` against both real APIs (multi-city question → streamed answer), marked so it runs only on explicit request with a key present, excluded from the default offline suite.
+
+- **Trace emission.** A test asserts that running a Turn with tracing enabled produces the expected spans (Turn → Tool Call), captured via an in-memory OTel span exporter — verifying instrumentation is wired without contacting LangSmith.
+
+- **Deliberately untested.** The terminal I/O edge in `start_repl` (fake-TTY fiddliness, near-zero signal) and the LLM's judgment beyond the e2e smoke check (evals territory, named as such in the README).
+
+## Out of Scope
+
+- **LangGraph.** Considered and rejected for this problem: the Turn is a linear single-tool loop, so a graph/checkpointer engine adds machinery without a job. It would earn its place only if meteobot grew genuinely graph-shaped control flow (branching, durable resume across sessions, human-in-the-loop pauses). Recorded here as a deliberate decision, not an omission.
+- **Packaging & CI hardening.** No Dockerfile, no GitHub Actions pipeline in this PRD. The console-script entry point and committed uv lockfile from v1 remain; broader shipping infrastructure is deferred.
+- **Server / hosted deployment.** meteobot stays a local REPL CLI. No HTTP API, no LangGraph Platform, no long-running service.
+- **Multi-provider abstraction.** OpenAI stays the single provider. PydanticAI makes provider-swapping cheap later, but v2 does not build or test that surface.
+- **Service-grade observability beyond traces.** Metrics dashboards, alerting, log aggregation pipelines, and cost budgets in LangSmith are left for later; v2 ships the traces themselves.
+
+## Further Notes
+
+- **Dependencies added:** `pydantic-ai-slim[openai]` (or `pydantic-ai`), plus the OpenTelemetry OTLP/HTTP exporter libraries used to ship spans to LangSmith. The OpenAI SDK and httpx remain. Removed code: `agent.py` (loop), `llm.py` (Protocol + adapter), `tools/registry.py`, and the TypedDict results in `tools/results.py` (superseded by Pydantic models).
+- **Interview framing.** This work exists to demonstrate fluency and judgment with a PydanticAI + LangSmith stack. The defensible narrative is as much about what was *not* used (LangGraph) and *why* as about what was built.
+- **Vocabulary.** `CONTEXT.md` is unchanged and still governs: Turn, Tool Round, Tool Call, History, Tool Error, Infrastructure Error. In v2, "Tool Round" maps onto one PydanticAI request iteration that issues Tool Calls, and the round cap maps onto the request usage limit.
